@@ -22,6 +22,11 @@ const (
 	txSlotSize  = 32 * 1024  // 32kB
 	txMaxSize   = 128 * 1024 //128Kb
 	topicNameV1 = "txpool/0.1"
+	maxAccountDemotions uint64 = 10
+
+	// maximum allowed number of consecutive blocks that don't have the account's transaction
+	maxAccountSkips = uint64(10)
+	pruningCooldown = 5000 * time.Millisecond	
 )
 
 // errors
@@ -375,14 +380,25 @@ func (p *TxPool) Prepare() {
 
 // Pop returns the best-price selected
 // transaction ready for execution.
-func (p *TxPool) Pop() *types.Transaction {
-	// Popping the executables queue
-	// does not remove the actual tx
-	// from the pool.
-	// The executables queue just provides
-	// insight into which account has the
-	// highest priced tx (head of promoted queue)
-	return p.executables.pop()
+func (p *TxPool) Pop(tx *types.Transaction) {
+	// fetch the associated account
+	account := p.accounts.get(tx.From)
+	account.promoted.lock(true)
+	defer account.promoted.unlock()
+	// pop the top most promoted tx
+	account.promoted.pop()
+
+	// successfully popping an account resets its demotions count to 0
+	account.resetDemotions()
+
+	// update state
+	p.gauge.decrease(slotsRequired(tx))
+	// update metrics
+	p.metrics.PendingTxs.Add(-1)
+	// update executables
+	if tx := account.promoted.peek(); tx != nil {
+		p.executables.push(tx)
+	}
 }
 
 // RemoveExecuted removes the executed transaction from promoted queue
@@ -502,6 +518,29 @@ func (p *TxPool) Drop(tx *types.Transaction) {
 		"next_nonce", nextNonce,
 		"address", tx.From.String(),
 	)
+}
+
+// Demote excludes an account from being further processed during block building
+// due to a recoverable error. If an account has been demoted too many times (maxAccountDemotions),
+// it is Dropped instead.
+func (p *TxPool) Demote(tx *types.Transaction) {
+	account := p.accounts.get(tx.From)
+	if account.Demotions() >= maxAccountDemotions {
+		p.logger.Debug(
+			"Demote: threshold reached - dropping account",
+			"addr", tx.From.String(),
+		)
+		p.Drop(tx)
+
+		// reset the demotions counter
+		account.resetDemotions()
+
+		return
+	}
+
+	account.incrementDemotions()
+
+	p.eventManager.signalEvent(proto.EventType_DEMOTED, tx.Hash)
 }
 
 // ResetWithHeaders processes the transactions from the new
@@ -698,9 +737,8 @@ func (p *TxPool) addTx(origin txOrigin, tx *types.Transaction) error {
 	}
 
 	// initialize account for this address once
-	if !p.accounts.exists(tx.From) {
-		p.createAccountOnce(tx.From)
-	}
+	p.createAccountOnce(tx.From)
+
 
 	// send request [BLOCKING]
 	p.enqueueReqCh <- enqueueRequest{tx: tx}
@@ -773,26 +811,16 @@ func (p *TxPool) handlePromoteRequest(req promoteRequest) {
 	account := p.accounts.get(addr)
 
 	// promote enqueued txs
-	promoted, dropped, replaced := account.promote()
+
+	promoted, pruned := account.promote()
 	p.logger.Debug("promote request", "promoted", promoted, "addr", addr.String())
 
-	// drop lower nonce txs first, to reduce the risk of mining.
-	if len(dropped) > 0 {
-		p.pruneEnqueuedTxs(dropped)
-		p.logger.Debug("dropped transactions when promoting", "dropped", dropped)
-	}
+	p.index.remove(pruned...)
+	p.gauge.decrease(slotsRequired(pruned...))
 
-	if len(replaced) > 0 {
-		p.index.remove(replaced...)
-		// state
-		p.gauge.decrease(slotsRequired(replaced...))
-		// metrics and event
-		p.decreaseQueueGauge(replaced, p.metrics.PendingTxs, proto.EventType_REPLACED)
-		p.logger.Debug("replaced transactions when promoting", "replaced", replaced)
-	}
-
-	// metrics and event
-	p.tranferQueueGauge(promoted, p.metrics.EnqueueTxs, p.metrics.PendingTxs, proto.EventType_PROMOTED)
+	// update metrics
+	p.metrics.PendingTxs.Add(float64(len(promoted)))
+	p.eventManager.signalEvent(proto.EventType_PROMOTED, toHash(promoted...)...)
 }
 
 // pruneStaleAccounts would find out all need-to-prune transactions,
@@ -887,33 +915,37 @@ func (p *TxPool) resetAccounts(stateNonces map[types.Address]uint64) {
 
 	//	clear all accounts of stale txs
 	for addr, newNonce := range stateNonces {
-		if !p.accounts.exists(addr) {
-			// no updates for this account
-			continue
-		}
+			account := p.accounts.get(addr)
 
-		account := p.accounts.get(addr)
+			if account == nil {
+				// no updates for this account
+				continue
+			}
+		
+
 		prunedPromoted, prunedEnqueued := account.reset(newNonce, p.promoteReqCh)
 
 		//	append pruned
 		allPrunedPromoted = append(allPrunedPromoted, prunedPromoted...)
 		allPrunedEnqueued = append(allPrunedEnqueued, prunedEnqueued...)
+		account.resetDemotions()
+
 	}
 
 	//	pool cleanup callback
-	cleanup := func(stale ...*types.Transaction) {
+	cleanup := func(stale []*types.Transaction) {
 		p.index.remove(stale...)
 		p.gauge.decrease(slotsRequired(stale...))
 	}
 
 	//	prune pool state
 	if len(allPrunedPromoted) > 0 {
-		cleanup(allPrunedPromoted...)
+		cleanup(allPrunedPromoted)
 		p.decreaseQueueGauge(allPrunedPromoted, p.metrics.PendingTxs, proto.EventType_PRUNED_PROMOTED)
 	}
 
 	if len(allPrunedEnqueued) > 0 {
-		cleanup(allPrunedEnqueued...)
+		cleanup(allPrunedEnqueued)
 		p.decreaseQueueGauge(allPrunedEnqueued, p.metrics.EnqueueTxs, proto.EventType_PRUNED_ENQUEUED)
 	}
 }
@@ -921,14 +953,16 @@ func (p *TxPool) resetAccounts(stateNonces map[types.Address]uint64) {
 // createAccountOnce creates an account and
 // ensures it is only initialized once.
 func (p *TxPool) createAccountOnce(newAddr types.Address) *account {
+	if p.accounts.exists(newAddr) {
+		return nil
+	}	
 	// fetch nonce from state
 	stateRoot := p.store.Header().StateRoot
 	stateNonce := p.store.GetNonce(stateRoot, newAddr)
 
 	// initialize the account
-	account := p.accounts.initOnce(newAddr, stateNonce)
+	return p.accounts.initOnce(newAddr, stateNonce)
 
-	return account
 }
 
 // Length returns the total number of all promoted transactions.

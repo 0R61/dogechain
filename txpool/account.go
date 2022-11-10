@@ -249,6 +249,7 @@ type account struct {
 	enqueued, promoted *accountQueue
 	nextNonce          uint64
 	lastPromoted       time.Time // timestamp for pruning
+	demotions          uint64
 }
 
 // getNonce returns the next expected nonce for this account.
@@ -259,6 +260,21 @@ func (a *account) getNonce() uint64 {
 // setNonce sets the next expected nonce for this account.
 func (a *account) setNonce(nonce uint64) {
 	atomic.StoreUint64(&a.nextNonce, nonce)
+}
+
+// Demotions returns the current value of demotions
+func (a *account) Demotions() uint64 {
+	return a.demotions
+}
+
+// resetDemotions sets 0 to demotions to clear count
+func (a *account) resetDemotions() {
+	a.demotions = 0
+}
+
+// incrementDemotions increments demotions
+func (a *account) incrementDemotions() {
+	a.demotions++
 }
 
 // reset aligns the account with the new nonce
@@ -273,10 +289,8 @@ func (a *account) reset(nonce uint64, promoteCh chan<- promoteRequest) (
 	defer a.promoted.unlock()
 
 	//	prune the promoted txs
-	prunedPromoted = append(
-		prunedPromoted,
-		a.promoted.prune(nonce)...,
-	)
+	prunedPromoted = a.promoted.prune(nonce)
+
 
 	if nonce <= a.getNonce() {
 		// only the promoted queue needed pruning
@@ -287,10 +301,8 @@ func (a *account) reset(nonce uint64, promoteCh chan<- promoteRequest) (
 	defer a.enqueued.unlock()
 
 	//	prune the enqueued txs
-	prunedEnqueued = append(
-		prunedEnqueued,
-		a.enqueued.prune(nonce)...,
-	)
+	prunedEnqueued = a.enqueued.prune(nonce)
+
 
 	//	update nonce expected for this account
 	a.setNonce(nonce)
@@ -298,8 +310,7 @@ func (a *account) reset(nonce uint64, promoteCh chan<- promoteRequest) (
 	//	it is important to signal promotion while
 	//	the locks are held to ensure no other
 	//	handler will mutate the account
-	if first := a.enqueued.peek(); first != nil &&
-		first.Nonce == nonce {
+	if first := a.enqueued.peek(); first != nil && first.Nonce == nonce {
 		// first enqueued tx is expected -> signal promotion
 		promoteCh <- promoteRequest{account: first.From}
 	}
@@ -345,11 +356,8 @@ func (a *account) enqueue(tx *types.Transaction) (oldTx *types.Transaction, err 
 // Eligible transactions are all sequential in order of nonce
 // and the first one has to have nonce less (or equal) to the account's
 // nextNonce. Lower nonce transaction would be dropped when promoting.
-func (a *account) promote() (
-	promoted []*types.Transaction,
-	dropped []*types.Transaction,
-	replaced []*types.Transaction,
-) {
+func (a *account) promote() (promoted []*types.Transaction, pruned []*types.Transaction) {
+	{
 	a.promoted.lock(true)
 	a.enqueued.lock(true)
 
@@ -360,8 +368,8 @@ func (a *account) promote() (
 
 	// sanity check
 	currentNonce := a.getNonce()
-	if a.enqueued.length() == 0 ||
-		a.enqueued.peek().Nonce > currentNonce {
+	if a.enqueued.length() == 0 || a.enqueued.peek().Nonce > currentNonce {
+
 		// nothing to promote
 		return
 	}
@@ -373,45 +381,21 @@ func (a *account) promote() (
 	//	to the account's promoted queue
 	for {
 		tx := a.enqueued.peek()
-		if tx == nil {
+		if tx == nil || tx.Nonce != nextNonce {
 			break // no transcation
 		}
 
-		// find replacable tx first
-		if old := a.promoted.GetTxByNonce(tx.Nonce); old != nil {
-			// pop out the transaction first
-			tx = a.enqueued.pop()
-
-			if _, old = a.promoted.Add(tx); old != nil {
-				// succed to replace old transaction
-				replaced = append(replaced, old)
-				promoted = append(promoted, tx)
-			}
-
-			continue
-		}
-
-		if tx.Nonce < nextNonce {
-			// pop out too low nonce tx, which should be drop
-			tx = a.enqueued.pop()
-			dropped = append(dropped, tx)
-
-			continue
-		} else if tx.Nonce > nextNonce {
-			// nothing to prmote
-			break
-		}
 
 		// pop from enqueued
 		tx = a.enqueued.pop()
+		// push to promoted
+		a.promoted.push(tx)
+				// update counters
 
-		if inserted, _ := a.promoted.Add(tx); !inserted {
-			// failed tx would not stop promoting.
-			continue
-		}
+		nextNonce = tx.Nonce + 1
 
-		// update counters
-		nextNonce += 1
+		// prune the transactions with lower nonce
+		pruned = append(pruned, a.enqueued.prune(nextNonce)...)
 
 		// update return result
 		promoted = append(promoted, tx)
@@ -421,11 +405,10 @@ func (a *account) promote() (
 	// is higher than the one previously stored.
 	if nextNonce > currentNonce {
 		a.setNonce(nextNonce)
-		// only update the promotion timestamp when it is actually promoted.
-		a.updatePromoted()
 	}
 
 	return
+}
 }
 
 // updatePromoted updates promoted timestamp
